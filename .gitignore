@@ -1,0 +1,11 @@
+# npm artifacts
+node_modules/
+*.tgz
+.npm/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

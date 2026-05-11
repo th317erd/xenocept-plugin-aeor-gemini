@@ -1,0 +1,34 @@
+{
+  "name": "xenocept-plugin-aeor-gemini",
+  "version": "1.4.0",
+  "description": "Xenocept plugin for Google Gemini — currently provides OCR (extracts on-screen text and an AI-generated scene description from session screenshots). Bundles room for future Gemini-as-destination support. Requires a Google AI Studio API key.",
+  "type": "module",
+  "main": "index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "xenocept": {
+    "pluginID": "org.aeor.xenocept.gemini"
+  },
+  "keywords": [
+    "xenocept",
+    "xenocept-plugin",
+    "plugin",
+    "ocr",
+    "gemini",
+    "google-ai",
+    "vision"
+  ],
+  "author": "Wyatt Greenway <th317erd@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/th317erd/xenocept-plugin-aeor-gemini.git"
+  },
+  "homepage": "https://github.com/th317erd/xenocept-plugin-aeor-gemini#readme",
+  "bugs": {
+    "url": "https://github.com/th317erd/xenocept-plugin-aeor-gemini/issues"
+  }
+}
