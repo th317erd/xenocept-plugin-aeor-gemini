@@ -84,15 +84,19 @@ const KNOWN_MODELS = [
 export function setup(context) {
   const { register, elements, log } = context;
   const { div, label, input, p, code, option } = elements;
-  const aeorSelect   = elements['aeor-select'];
-  const aeorCheckbox = elements['aeor-checkbox'];
+  const aeorSelect        = elements['aeor-select'];
+  const aeorConfirmButton = elements['aeor-confirm-button'];
 
-  register(class GeminiOcrPlugin extends context.Plugin {
+  register(class GeminiPlugin extends context.Plugin {
     static pluginID    = PLUGIN_ID;
-    static name        = 'Gemini OCR';
-    static version     = '1.4.0';
+    static name        = 'Gemini';
+    static version     = '1.6.0';
     static icon        = '\u{1F50D}'; // 🔍
     static description = 'OCR sessions with Google Gemini. Requires an API key — costs accrue to your Google account at the model\'s per-token rate.';
+    /// Declare the OCR role so the loader's master/slave chain knows
+    /// to include this plugin (and skip it from the parallel
+    /// onProcessing fan-out, where it would race other OCR providers).
+    static role        = 'ocr';
 
     constructor(ctx) {
       super(ctx);
@@ -105,14 +109,20 @@ export function setup(context) {
     /// Plugin-level config UI. Same renderConfigUI shape destinations
     /// use, so the host's generic config modal can host us. Any [name]'d
     /// field is auto-persisted by the host.
-    renderConfigUI(container, currentConfig, _host) {
+    ///
+    /// Async because the OCR-master row needs to know who the current
+    /// master is before deciding whether to render a "Hold to promote"
+    /// confirm-button vs a "you're the master" status hint. The host
+    /// awaits this method (see openPluginConfigModal) so the modal
+    /// mounts in its final layout, not flickering.
+    async renderConfigUI(container, currentConfig, _host) {
       const cfg = currentConfig || {};
       const apiKeyValue = cfg.apiKey || '';
       const modelValue  = cfg.model  || DEFAULT_MODEL;
 
       const apiKeyGroup = div.class('form-group')(
-        label.class('form-label').for('gemini-ocr-api-key')('API key'),
-        input.type('password').id('gemini-ocr-api-key').name('apiKey')
+        label.class('form-label').for('gemini-api-key')('API key'),
+        input.type('password').id('gemini-api-key').name('apiKey')
           .placeholder('AIza...').value(apiKeyValue)(),
         div.class('settings-hint')(
           'Generate one at ', code('aistudio.google.com/apikey'),
@@ -129,9 +139,9 @@ export function setup(context) {
         : [modelValue, ...KNOWN_MODELS];
 
       const modelGroup = div.class('form-group')(
-        label.class('form-label').for('gemini-ocr-model')('Model'),
+        label.class('form-label').for('gemini-model')('Model'),
         aeorSelect
-          .id('gemini-ocr-model')
+          .id('gemini-model')
           .name('model')
           .placeholder(DEFAULT_MODEL)
           .value(modelValue)(
@@ -143,28 +153,6 @@ export function setup(context) {
         ),
       );
 
-      // Phase toggle — Processing (block dispatch until OCR finishes) vs
-      // Completion (dispatch immediately, OCR runs after and re-indexes
-      // the session). Default is the safer "block" behavior so the very
-      // first message a destination sees already carries the enrichment.
-      // Uses the shared aeor-checkbox so the form harvester picks the
-      // value up via the internal <input name="wait_until_completion">.
-      const waitDefault = (cfg.wait_until_completion !== false); // default true
-      let waitCheckbox = aeorCheckbox.name('wait_until_completion').id('gemini-ocr-wait');
-      if (waitDefault) waitCheckbox = waitCheckbox.checked('');
-      const waitGroup = div.class('form-group')(
-        waitCheckbox('Wait until OCR completes before submission'),
-        div.class('settings-hint')(
-          'On (default): the session waits up to ~30s for Gemini to finish,',
-          ' so destinations receive the OCR text and AI description with the',
-          ' initial message. Useful for Claude / Codex / agent destinations.',
-          ' Off: the session is dispatched immediately with no enrichment,',
-          ' and Gemini runs in the background — the session is re-indexed',
-          ' when OCR completes so search still finds it later. Useful if your',
-          ' workflow only needs the screenshot delivered fast.',
-        ),
-      );
-
       const note = p.class('plugin-marketplace-notice')(
         'OCR runs automatically on every new session after this plugin is configured.',
         ' Existing sessions are not back-filled.',
@@ -172,11 +160,70 @@ export function setup(context) {
 
       container.appendChild(apiKeyGroup.build(document));
       container.appendChild(modelGroup.build(document));
-      container.appendChild(waitGroup.build(document));
       container.appendChild(note.build(document));
+
+      // OCR master/slave promotion. The button takes 5 seconds of
+      // sustained hold to confirm (aeor-confirm-button) so it can't be
+      // accidentally clicked. When confirmed, this plugin becomes the
+      // master; the loader's chain calls it first on every session
+      // and only falls through to slaves on failure.
+      await this._renderOcrMasterControl(container);
 
       // Invalidate cached config so the next session pickup re-reads.
       this._configCache = null;
+    }
+
+    async _renderOcrMasterControl(container) {
+      const { div }           = context.elements;
+      const aeorConfirmButton = context.elements['aeor-confirm-button'];
+      const aeorInfoBox       = context.elements['aeor-info-box'];
+
+      // Resolve role-level state BEFORE building so we can express the
+      // whole row declaratively in one DSL tree. No post-build innerHTML
+      // or appendChild rewriting.
+      let currentMasterID = null;
+      try { currentMasterID = await context.getOcrMaster?.(); } catch { /* ignore */ }
+      const amMaster = currentMasterID === 'xenocept-plugin-aeor-gemini';
+
+      // The button is always present. When this plugin is the current
+      // master, it's disabled — there's nothing to promote to. When this
+      // plugin is a slave (or no master is set), holding the button for
+      // 5 seconds promotes it. Master/slave is explained in the info-box
+      // beneath either way so the user understands what the action
+      // implies before they perform it.
+      let confirmBtn = aeorConfirmButton
+        .label(amMaster ? 'OCR master (current)' : 'Hold to make OCR master')
+        .confirmedText('Now OCR master ✓')
+        .duration('5000')
+        .ariaLabel(amMaster
+          ? 'This plugin is already the OCR master'
+          : 'Hold for 5 seconds to make Gemini the OCR master');
+      if (amMaster) {
+        confirmBtn = confirmBtn.disabled('');
+      } else {
+        // The DSL maps `.onXxx(handler)` to addEventListener('xxx') —
+        // same wiring as `.onClick`, just for the custom `confirm`
+        // event aeor-confirm-button dispatches when the hold completes.
+        confirmBtn = confirmBtn.onConfirm(async () => {
+          try {
+            await context.setOcrMaster('xenocept-plugin-aeor-gemini');
+            log.info('promoted to OCR master');
+          } catch (error) {
+            log.warn('failed to promote to OCR master:', error);
+          }
+        });
+      }
+
+      const masterRow = div.class('form-group')(
+        confirmBtn(),
+        aeorInfoBox.kind(amMaster ? 'success' : 'info')(
+          amMaster
+            ? 'This plugin is the current OCR master. It runs first on every session; other OCR plugins are slaves and only run if it fails. To swap, open another OCR plugin\'s Configure dialog and hold its master button.'
+            : 'OCR runs in a master/slave chain. The master tries first on every session; if it returns no result or fails, the loader falls through to slaves in install order. Hold the button above for 5 seconds to make this plugin the master.',
+        ),
+      );
+
+      container.appendChild(masterRow.build(document));
     }
 
     async _loadConfig() {
@@ -202,64 +249,44 @@ export function setup(context) {
       }
     }
 
-    /// PROCESSING phase — runs as part of the pre-dispatch barrier.
-    /// Only does work if the user has the "Wait until OCR completes
-    /// before submission" checkbox ON (the default). When OFF, we
-    /// defer to onCompletion below so the session dispatches first
-    /// and OCR backfills after.
-    async onProcessing({ sessionID }) {
-      const config = await this._loadConfig();
-      if (config.wait_until_completion === false) return;
-      return this._run(sessionID, config);
-    }
-
-    /// COMPLETION phase — runs after dispatch returns. Only does work
-    /// if the user has explicitly opted out of the barrier above. In
-    /// that case the destinations already saw an un-enriched session;
-    /// our /enrich call re-indexes it so search picks it up.
-    async onCompletion({ sessionID }) {
-      const config = await this._loadConfig();
-      if (config.wait_until_completion !== false) return;
-      return this._run(sessionID, config);
-    }
-
-    async _run(sessionID, config) {
-      if (!sessionID) return;
+    /// OCR-role provider — called by the loader's OCR chain. Returns
+    /// `{ ocr_text, alternative_description }` on success; throws or
+    /// returns null on failure so the chain can fall through to the
+    /// next slave provider. The loader takes care of writing the
+    /// result to `/enrich`, so this method just produces data.
+    async onOcr({ sessionID }) {
+      if (!sessionID) return null;
       if (this._inflight >= this._maxInflight) {
-        log.info('skipping — another OCR call is already in flight for this user');
-        return;
+        log.info('skipping — another Gemini OCR call is already in flight');
+        return null;
       }
-
+      const config = await this._loadConfig();
       const apiKey = (config.apiKey || '').trim();
       const model  = (config.model  || DEFAULT_MODEL).trim();
-      if (!apiKey) {
-        // Quietly opt out until the user configures a key. Don't spam
-        // the console on every session.
-        return;
-      }
+      if (!apiKey) return null; // unconfigured — declining lets the chain move on
 
       this._inflight++;
       try {
         const { ocrText, altDescription } = await this._extract(sessionID, apiKey, model);
-        // Push both fields through xenocept's generic enrich endpoint
-        // in a single round-trip; the backend merges them into
-        // session.json and re-runs the indexer.
-        await fetch(`/api/v1/sessions/${encodeURIComponent(sessionID)}/enrich`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({
-            fields: {
-              ocr_text:                ocrText,
-              alternative_description: altDescription,
-            },
-          }),
-        });
-        log.info(`ocr ok for ${sessionID} (text=${ocrText.length}, desc=${altDescription.length})`);
-      } catch (error) {
-        log.warn(`ocr failed for ${sessionID}:`, error);
+        if (!ocrText && !altDescription) return null;
+        return {
+          ocr_text:                ocrText,
+          alternative_description: altDescription,
+        };
       } finally {
         this._inflight--;
       }
+    }
+
+    /// Tells the loader's chain whether to invoke us during the
+    /// OCR runs in the Processing phase — the session waits for OCR
+    /// to land before dispatch so the very first message a destination
+    /// receives already carries the enrichment. This used to be a
+    /// per-plugin toggle; we collapsed it to a fixed default because
+    /// the alternative (background-then-reindex) was confusing in the
+    /// UI and no one set it.
+    async preferredOcrPhase() {
+      return 'processing';
     }
 
     async _extract(sessionID, apiKey, model) {
